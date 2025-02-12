@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <gbm.h>
 #include <libinput.h>
+#include <linux/input-event-codes.h>
 #include <libudev.h>
 #include <string.h>
 #include <wayland-server.h>
@@ -160,11 +161,15 @@ static struct {
     unsigned int y;
     unsigned int screen_width;
     unsigned int screen_height;
+    // bitmask of wpe_input_pointer_modifier_buttonX updated as pointer buttons are 
+    // pressed and released, to populate the .modifier field of wpe_input_pointer_event
+    uint32_t held_buttons;
 } cursor = {
     .enabled = FALSE,
     .device = NULL,
     .plane = NULL,
     .cursor = NULL,
+    .held_buttons = 0,
 };
 
 static struct {
@@ -878,9 +883,13 @@ input_handle_pointer_motion_event(struct libinput_event_pointer *pointer_event, 
         .time = libinput_event_pointer_get_time(pointer_event),
         .x = cursor.x,
         .y = cursor.y,
-        .button = 0,
+        // button property not reliable except for pressed events, so okay to omit
+        // see: https://w3c.github.io/uievents/#dom-mouseevent-button note indicating
+        // 0 is the uninitialized value for these types of event
+        .button = 0, 
+        // state only appropriate for press/release events
         .state = 0,
-        .modifiers = 0,
+        .modifiers = cursor.held_buttons,
     };
 
     wpe_view_backend_dispatch_pointer_event(wpe_view_data.backend, &event);
@@ -893,14 +902,50 @@ input_handle_pointer_button_event (struct libinput_event_pointer *pointer_event)
     if (!cursor.enabled)
         return;
 
+    uint32_t pressed =
+        libinput_event_pointer_get_button_state(pointer_event)
+            == LIBINPUT_BUTTON_STATE_PRESSED ? 1 : 0;
+    uint32_t libinput_button = libinput_event_pointer_get_button(pointer_event);
+
+    uint32_t wpe_modifier = 0;
+
+    // values for wpe_input_pointer_event don't appear to have symbolic constants, so
+    // values are taken from WebKit::WebEventFactory::createWebMouseEvent which consumes
+    // the structure on the other end. 0 is notably unused, so use it here as unrecognized.
+    uint32_t wpe_button = 0;
+
+    switch (libinput_button) {
+    case BTN_LEFT:
+        wpe_modifier = wpe_input_pointer_modifier_button1;
+        wpe_button = 1; 
+        break;
+
+    case BTN_MIDDLE:
+        wpe_modifier = wpe_input_pointer_modifier_button3;
+        wpe_button = 3;
+        break;
+
+    case BTN_RIGHT:
+        wpe_modifier = wpe_input_pointer_modifier_button2;
+        wpe_button = 2;
+        break;
+    }
+
+    if (wpe_button == 0) 
+        return;
+    
+    cursor.held_buttons &= ~wpe_modifier;
+    if (pressed)
+        cursor.held_buttons |= wpe_modifier;
+
     struct wpe_input_pointer_event event = {
         .type = wpe_input_pointer_event_type_button,
         .time = libinput_event_pointer_get_time(pointer_event),
         .x = cursor.x,
         .y = cursor.y,
-        .button = libinput_event_pointer_get_button(pointer_event),
-        .state = libinput_event_pointer_get_button_state(pointer_event),
-        .modifiers = 0,
+        .button = wpe_button,
+        .state = pressed, // no symbolic constants, used as bool by createWebMouseEvent
+        .modifiers = cursor.held_buttons,
     };
 
     wpe_view_backend_dispatch_pointer_event(wpe_view_data.backend, &event);
